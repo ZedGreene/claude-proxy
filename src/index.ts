@@ -1,102 +1,212 @@
-/**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
- */
-import { Env, ChatMessage } from "./types";
+// Janitor AI -> Anthropic bridge (Cloudflare Worker)
+// Secrets needed: ANTHROPIC_API_KEY (required), PROXY_PASSWORD (optional but recommended)
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
-const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 
-// Default system prompt
-const SYSTEM_PROMPT =
-	"You are a helpful, friendly assistant. Provide concise and accurate responses.";
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+};
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...CORS, "Content-Type": "application/json" },
+  });
+}
+
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === "string" ? p : p.text || "")).join("");
+  }
+  return "";
+}
+
+function pushMsg(msgs, role, text) {
+  const prev = msgs[msgs.length - 1];
+  if (prev && prev.role === role) prev.content += "\n\n" + text;
+  else msgs.push({ role, content: text });
+}
+
+// OpenAI messages -> Anthropic system + alternating user/assistant messages
+function convertMessages(openaiMessages) {
+  const systemParts = [];
+  const msgs = [];
+  for (const m of openaiMessages) {
+    const text = textOf(m.content);
+    if (!text) continue;
+    if (m.role === "system") {
+      if (msgs.length === 0) systemParts.push(text);
+      else pushMsg(msgs, "user", text);
+    } else {
+      pushMsg(msgs, m.role === "assistant" ? "assistant" : "user", text);
+    }
+  }
+  if (msgs.length === 0 || msgs[0].role !== "user") {
+    msgs.unshift({ role: "user", content: "(Begin the roleplay.)" });
+  }
+  if (msgs[msgs.length - 1].role !== "user") {
+    msgs.push({ role: "user", content: "(Continue.)" });
+  }
+  return { system: systemParts.join("\n\n"), msgs };
+}
+
+// Anthropic SSE stream -> OpenAI SSE stream
+function convertStream(upstreamBody, model) {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const id = "chatcmpl-" + Date.now();
+  const created = Math.floor(Date.now() / 1000);
+  let buf = "";
+
+  const chunk = (delta, finish = null) =>
+    enc.encode(
+      "data: " +
+        JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        }) +
+        "\n\n"
+    );
+
+  const ts = new TransformStream({
+    start(controller) {
+      controller.enqueue(chunk({ role: "assistant", content: "" }));
+    },
+    transform(raw, controller) {
+      buf += dec.decode(raw, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const d = line.slice(5).trim();
+        if (!d) continue;
+        let ev;
+        try {
+          ev = JSON.parse(d);
+        } catch {
+          continue;
+        }
+        if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
+          controller.enqueue(chunk({ content: ev.delta.text }));
+        } else if (ev.type === "message_delta") {
+          const reason = ev.delta && ev.delta.stop_reason === "max_tokens" ? "length" : "stop";
+          controller.enqueue(chunk({}, reason));
+        } else if (ev.type === "error") {
+          const msg = (ev.error && ev.error.message) || "unknown error";
+          controller.enqueue(chunk({ content: "\n[Anthropic error: " + msg + "]" }, "stop"));
+        }
+      }
+    },
+    flush(controller) {
+      controller.enqueue(enc.encode("data: [DONE]\n\n"));
+    },
+  });
+
+  return upstreamBody.pipeThrough(ts);
+}
 
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		const url = new URL(request.url);
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: CORS });
+    }
 
-		// Handle static assets (frontend)
-		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-			return env.ASSETS.fetch(request);
-		}
+    const url = new URL(request.url);
+    if (!url.pathname.endsWith("/chat/completions")) {
+      return new Response("Claude bridge active", { status: 200, headers: CORS });
+    }
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+    // Optional password so strangers can't use your key
+    if (env.PROXY_PASSWORD) {
+      const auth = request.headers.get("Authorization") || "";
+      if (auth !== "Bearer " + env.PROXY_PASSWORD) {
+        return json({ error: { message: "Unauthorized: wrong proxy password" } }, 401);
+      }
+    }
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
-		}
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: { message: "Invalid JSON body" } }, 400);
+    }
 
-		// Handle 404 for unmatched routes
-		return new Response("Not found", { status: 404 });
-	},
-} satisfies ExportedHandler<Env>;
+    const { system, msgs } = convertMessages(body.messages || []);
 
-/**
- * Handles chat API requests
- */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-): Promise<Response> {
-	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
-		};
+    // Prompt caching: mark the system prompt and the latest message
+    const last = msgs[msgs.length - 1];
+    last.content = [{ type: "text", text: last.content, cache_control: { type: "ephemeral" } }];
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-		}
+    const payload = {
+      model: body.model,
+      max_tokens: body.max_tokens || 4096,
+      stream: !!body.stream,
+      messages: msgs,
+    };
+    if (system) {
+      payload.system = [{ type: "text", text: system, cache_control: { type: "ephemeral" } }];
+    }
+    if (typeof body.temperature === "number") {
+      payload.temperature = Math.min(Math.max(body.temperature, 0), 1);
+    }
 
-		const inputs = {
-			messages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+    let upstream;
+    try {
+      upstream = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      return json({ error: { message: "Could not reach Anthropic: " + err.message } }, 502);
+    }
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
+    if (!upstream.ok) {
+      const t = await upstream.text();
+      return json({ error: { message: "Anthropic " + upstream.status + ": " + t } }, upstream.status);
+    }
 
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
-	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
-}
+    if (body.stream) {
+      return new Response(convertStream(upstream.body, body.model), {
+        headers: {
+          ...CORS,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        },
+      });
+    }
+
+    const data = await upstream.json();
+    const text = (data.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+    return json({
+      id: data.id,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: data.model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: text },
+          finish_reason: data.stop_reason === "max_tokens" ? "length" : "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: (data.usage && data.usage.input_tokens) || 0,
+        completion_tokens: (data.usage && data.usage.output_tokens) || 0,
+      },
+    });
+  },
+};
