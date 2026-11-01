@@ -7,7 +7,7 @@ const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version",
-"Access-Control-Max-Age": "86400",
+  "Access-Control-Max-Age": "86400",
 };
 
 function json(obj, status = 200) {
@@ -152,9 +152,6 @@ export default {
     };
     if (system) {
       payload.system = [{ type: "text", text: system, cache_control: { type: "ephemeral" } }];
-    }
-    if (typeof body.temperature === "number") {
-      payload.temperature = Math.min(Math.max(body.temperature, 0), 1);
     }
 
     let upstream;
