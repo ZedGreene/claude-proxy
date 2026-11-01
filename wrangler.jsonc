@@ -2,6 +2,7 @@
 	"name": "claude-proxy",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-10-08",
+	"keep_vars": true,
 	"observability": {
 		"enabled": true
 	}
